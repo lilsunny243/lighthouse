@@ -13,6 +13,7 @@ use slog::{info, warn, Logger};
 use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use types::{Address, GRAFFITI_BYTES_LEN};
 
 pub const DEFAULT_BEACON_NODE: &str = "http://localhost:5052/";
@@ -52,6 +53,11 @@ pub struct Config {
     /// If true, enable functionality that monitors the network for attestations or proposals from
     /// any of the validators managed by this client before starting up.
     pub enable_doppelganger_protection: bool,
+    /// If true, then we publish validator specific metrics (e.g next attestation duty slot)
+    /// for all our managed validators.
+    /// Note: We publish validator specific metrics for low validator counts without this flag
+    /// (<= 64 validators)
+    pub enable_high_validator_count_metrics: bool,
     /// Enable use of the blinded block endpoints during proposals.
     pub builder_proposals: bool,
     /// Overrides the timestamp field in builder api ValidatorRegistrationV1
@@ -61,9 +67,12 @@ pub struct Config {
     /// A list of custom certificates that the validator client will additionally use when
     /// connecting to a beacon node over SSL/TLS.
     pub beacon_nodes_tls_certs: Option<Vec<PathBuf>>,
-    /// Enabling this will make sure the validator client never signs a block whose `fee_recipient`
-    /// does not match the `suggested_fee_recipient`.
-    pub strict_fee_recipient: bool,
+    /// Delay from the start of the slot to wait before publishing a block.
+    ///
+    /// This is *not* recommended in prod and should only be used for testing.
+    pub block_delay: Option<Duration>,
+    /// Disables publishing http api requests to all beacon nodes for select api calls.
+    pub disable_run_on_all: bool,
 }
 
 impl Default for Config {
@@ -95,11 +104,13 @@ impl Default for Config {
             http_metrics: <_>::default(),
             monitoring_api: None,
             enable_doppelganger_protection: false,
+            enable_high_validator_count_metrics: false,
             beacon_nodes_tls_certs: None,
+            block_delay: None,
             builder_proposals: false,
             builder_registration_timestamp_override: None,
             gas_limit: None,
-            strict_fee_recipient: false,
+            disable_run_on_all: false,
         }
     }
 }
@@ -181,6 +192,7 @@ impl Config {
         }
 
         config.allow_unsynced_beacon_node = cli_args.is_present("allow-unsynced");
+        config.disable_run_on_all = cli_args.is_present("disable-run-on-all");
         config.disable_auto_discover = cli_args.is_present("disable-auto-discover");
         config.init_slashing_protection = cli_args.is_present("init-slashing-protection");
         config.use_long_timeouts = cli_args.is_present("use-long-timeouts");
@@ -267,6 +279,10 @@ impl Config {
             config.http_metrics.enabled = true;
         }
 
+        if cli_args.is_present("enable-high-validator-count-metrics") {
+            config.enable_high_validator_count_metrics = true;
+        }
+
         if let Some(address) = cli_args.value_of("metrics-address") {
             config.http_metrics.listen_addr = address
                 .parse::<IpAddr>()
@@ -296,9 +312,12 @@ impl Config {
          * Explorer metrics
          */
         if let Some(monitoring_endpoint) = cli_args.value_of("monitoring-endpoint") {
+            let update_period_secs =
+                clap_utils::parse_optional(cli_args, "monitoring-endpoint-period")?;
             config.monitoring_api = Some(monitoring_api::Config {
                 db_path: None,
                 freezer_db_path: None,
+                update_period_secs,
                 monitoring_endpoint: monitoring_endpoint.to_string(),
             });
         }
@@ -331,7 +350,18 @@ impl Config {
         }
 
         if cli_args.is_present("strict-fee-recipient") {
-            config.strict_fee_recipient = true;
+            warn!(
+                log,
+                "The flag `--strict-fee-recipient` has been deprecated due to a bug causing \
+                missed proposals. The flag will be ignored."
+            );
+        }
+
+        /*
+         * Experimental
+         */
+        if let Some(delay_ms) = parse_optional::<u64>(cli_args, "block-delay-ms")? {
+            config.block_delay = Some(Duration::from_millis(delay_ms));
         }
 
         Ok(config)

@@ -236,21 +236,6 @@ impl<'a, T: Serialize> From<&'a T> for GenericResponseRef<'a, T> {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
-pub struct ExecutionOptimisticForkVersionedResponse<T> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<ForkName>,
-    pub execution_optimistic: Option<bool>,
-    pub data: T,
-}
-
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
-pub struct ForkVersionedResponse<T> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<ForkName>,
-    pub data: T,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RootData {
     pub root: Hash256,
@@ -270,9 +255,18 @@ pub struct FinalityCheckpointsData {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "&str")]
 pub enum ValidatorId {
     PublicKey(PublicKeyBytes),
     Index(u64),
+}
+
+impl TryFrom<&str> for ValidatorId {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::from_str(s)
+    }
 }
 
 impl FromStr for ValidatorId {
@@ -456,6 +450,11 @@ pub struct SyncCommitteesQuery {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct RandaoQuery {
+    pub epoch: Option<Epoch>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct AttestationPoolQuery {
     pub slot: Option<Slot>,
     pub committee_index: Option<u64>,
@@ -484,6 +483,11 @@ pub struct SyncCommitteeByValidatorIndices {
     #[serde(with = "eth2_serde_utils::quoted_u64_vec")]
     pub validators: Vec<u64>,
     pub validator_aggregates: Vec<SyncSubcommittee>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RandaoMix {
+    pub randao: Hash256,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -658,16 +662,34 @@ pub struct ProposerData {
     pub slot: Slot,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ValidatorBlocksQuery {
-    pub randao_reveal: Option<SignatureBytes>,
+    pub randao_reveal: SignatureBytes,
     pub graffiti: Option<Graffiti>,
-    #[serde(default = "default_verify_randao")]
-    pub verify_randao: bool,
+    pub skip_randao_verification: SkipRandaoVerification,
 }
 
-fn default_verify_randao() -> bool {
-    true
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "Option<String>")]
+pub enum SkipRandaoVerification {
+    Yes,
+    #[default]
+    No,
+}
+
+/// Parse a `skip_randao_verification` query parameter.
+impl TryFrom<Option<String>> for SkipRandaoVerification {
+    type Error = String;
+
+    fn try_from(opt: Option<String>) -> Result<Self, String> {
+        match opt.as_deref() {
+            None => Ok(SkipRandaoVerification::No),
+            Some("") => Ok(SkipRandaoVerification::Yes),
+            Some(s) => Err(format!(
+                "skip_randao_verification does not take a value, got: {s}"
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1090,6 +1112,38 @@ pub struct LivenessResponseData {
     pub index: u64,
     pub epoch: Epoch,
     pub is_live: bool,
+}
+
+#[derive(PartialEq, Debug, Serialize, Deserialize)]
+#[serde(bound = "T: EthSpec, Payload: AbstractExecPayload<T>")]
+pub struct BlocksAndBlobs<T: EthSpec, Payload: AbstractExecPayload<T>> {
+    pub block: BeaconBlock<T, Payload>,
+    pub blobs: Vec<Blob<T>>,
+    pub kzg_aggregate_proof: KzgProof,
+}
+
+impl<T: EthSpec, Payload: AbstractExecPayload<T>> ForkVersionDeserialize
+    for BlocksAndBlobs<T, Payload>
+{
+    fn deserialize_by_fork<'de, D: serde::Deserializer<'de>>(
+        value: serde_json::value::Value,
+        fork_name: ForkName,
+    ) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(bound = "T: EthSpec")]
+        struct Helper<T: EthSpec> {
+            block: serde_json::Value,
+            blobs: Vec<Blob<T>>,
+            kzg_aggregate_proof: KzgProof,
+        }
+        let helper: Helper<T> = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+
+        Ok(Self {
+            block: BeaconBlock::deserialize_by_fork::<'de, D>(helper.block, fork_name)?,
+            blobs: helper.blobs,
+            kzg_aggregate_proof: helper.kzg_aggregate_proof,
+        })
+    }
 }
 
 #[cfg(test)]

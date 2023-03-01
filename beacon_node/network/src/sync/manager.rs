@@ -47,13 +47,13 @@ use lighthouse_network::rpc::methods::MAX_REQUEST_BLOCKS;
 use lighthouse_network::types::{NetworkGlobals, SyncState};
 use lighthouse_network::SyncInfo;
 use lighthouse_network::{PeerAction, PeerId};
-use slog::{crit, debug, error, info, trace, Logger};
+use slog::{crit, debug, error, info, trace, warn, Logger};
 use std::boxed::Box;
 use std::ops::Sub;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use types::{EthSpec, Hash256, SignedBeaconBlock, Slot};
+use types::{BlobsSidecar, EthSpec, Hash256, SignedBeaconBlock, Slot};
 
 /// The number of slots ahead of us that is allowed before requesting a long-range (batch)  Sync
 /// from a peer. If a peer is within this tolerance (forwards or backwards), it is treated as a
@@ -93,8 +93,16 @@ pub enum SyncMessage<T: EthSpec> {
         seen_timestamp: Duration,
     },
 
+    /// A blob has been received from RPC.
+    RpcBlob {
+        peer_id: PeerId,
+        request_id: RequestId,
+        blob_sidecar: Option<Arc<BlobsSidecar<T>>>,
+        seen_timestamp: Duration,
+    },
+
     /// A block with an unknown parent has been received.
-    UnknownBlock(PeerId, Arc<SignedBeaconBlock<T>>),
+    UnknownBlock(PeerId, Arc<SignedBeaconBlock<T>>, Hash256),
 
     /// A peer has sent an object that references a block that is unknown. This triggers the
     /// manager to attempt to find the block matching the unknown hash.
@@ -503,7 +511,7 @@ impl<T: BeaconChainTypes> SyncManager<T> {
             } => {
                 self.rpc_block_received(request_id, peer_id, beacon_block, seen_timestamp);
             }
-            SyncMessage::UnknownBlock(peer_id, block) => {
+            SyncMessage::UnknownBlock(peer_id, block, block_root) => {
                 // If we are not synced or within SLOT_IMPORT_TOLERANCE of the block, ignore
                 if !self.network_globals.sync_state.read().is_synced() {
                     let head_slot = self.chain.canonical_head.cached_head().head_slot();
@@ -523,7 +531,7 @@ impl<T: BeaconChainTypes> SyncManager<T> {
                     && self.network.is_execution_engine_online()
                 {
                     self.block_lookups
-                        .search_parent(block, peer_id, &mut self.network);
+                        .search_parent(block_root, block, peer_id, &mut self.network);
                 }
             }
             SyncMessage::UnknownBlockHash(peer_id, block_hash) => {
@@ -584,6 +592,9 @@ impl<T: BeaconChainTypes> SyncManager<T> {
                     .block_lookups
                     .parent_chain_processed(chain_hash, result, &mut self.network),
             },
+            SyncMessage::RpcBlob { .. } => {
+                warn!(self.log, "Unexpected blob message received");
+            }
         }
     }
 
@@ -633,7 +644,7 @@ impl<T: BeaconChainTypes> SyncManager<T> {
 
                 // Some logs.
                 if dropped_single_blocks_requests > 0 || dropped_parent_chain_requests > 0 {
-                    debug!(self.log, "Execution engine not online, dropping active requests.";
+                    debug!(self.log, "Execution engine not online. Dropping active requests.";
                         "dropped_single_blocks_requests" => dropped_single_blocks_requests,
                         "dropped_parent_chain_requests" => dropped_parent_chain_requests,
                     );

@@ -1,11 +1,13 @@
 use crate::proto_array::ProposerBoost;
 use crate::{
-    proto_array::{ProtoArray, ProtoNode},
+    proto_array::{CountUnrealizedFull, ProtoArray, ProtoNode},
     proto_array_fork_choice::{ElasticList, ProtoArrayForkChoice, VoteTracker},
+    Error, JustifiedBalances,
 };
 use ssz::{four_byte_option_impl, Encode};
 use ssz_derive::{Decode, Encode};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use types::{Checkpoint, Hash256};
 
 // Define a "legacy" implementation of `Option<usize>` which uses four bytes for encoding the union
@@ -30,7 +32,7 @@ impl From<&ProtoArrayForkChoice> for SszContainer {
 
         Self {
             votes: from.votes.0.clone(),
-            balances: from.balances.clone(),
+            balances: from.balances.effective_balances.clone(),
             prune_threshold: proto_array.prune_threshold,
             justified_checkpoint: proto_array.justified_checkpoint,
             finalized_checkpoint: proto_array.finalized_checkpoint,
@@ -41,8 +43,12 @@ impl From<&ProtoArrayForkChoice> for SszContainer {
     }
 }
 
-impl From<SszContainer> for ProtoArrayForkChoice {
-    fn from(from: SszContainer) -> Self {
+impl TryFrom<(SszContainer, CountUnrealizedFull)> for ProtoArrayForkChoice {
+    type Error = Error;
+
+    fn try_from(
+        (from, count_unrealized_full): (SszContainer, CountUnrealizedFull),
+    ) -> Result<Self, Error> {
         let proto_array = ProtoArray {
             prune_threshold: from.prune_threshold,
             justified_checkpoint: from.justified_checkpoint,
@@ -50,12 +56,13 @@ impl From<SszContainer> for ProtoArrayForkChoice {
             nodes: from.nodes,
             indices: from.indices.into_iter().collect::<HashMap<_, _>>(),
             previous_proposer_boost: from.previous_proposer_boost,
+            count_unrealized_full,
         };
 
-        Self {
+        Ok(Self {
             proto_array,
             votes: ElasticList(from.votes),
-            balances: from.balances,
-        }
+            balances: JustifiedBalances::from_effective_balances(from.balances)?,
+        })
     }
 }

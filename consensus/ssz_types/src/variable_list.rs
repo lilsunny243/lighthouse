@@ -176,6 +176,15 @@ impl<'a, T, N: Unsigned> IntoIterator for &'a VariableList<T, N> {
     }
 }
 
+impl<T, N: Unsigned> IntoIterator for VariableList<T, N> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vec.into_iter()
+    }
+}
+
 impl<T, N: Unsigned> tree_hash::TreeHash for VariableList<T, N>
 where
     T: tree_hash::TreeHash,
@@ -184,7 +193,7 @@ where
         tree_hash::TreeHashType::List
     }
 
-    fn tree_hash_packed_encoding(&self) -> Vec<u8> {
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
         unreachable!("List should never be packed.")
     }
 
@@ -273,7 +282,7 @@ impl<'a, T: arbitrary::Arbitrary<'a>, N: 'static + Unsigned> arbitrary::Arbitrar
         for _ in 0..size {
             vec.push(<T>::arbitrary(u)?);
         }
-        Ok(Self::new(vec).map_err(|_| arbitrary::Error::IncorrectFormat)?)
+        Self::new(vec).map_err(|_| arbitrary::Error::IncorrectFormat)
     }
 }
 
@@ -308,7 +317,7 @@ mod test {
 
         assert_eq!(fixed[0], 1);
         assert_eq!(&fixed[0..1], &vec[0..1]);
-        assert_eq!((&fixed[..]).len(), 2);
+        assert_eq!((fixed[..]).len(), 2);
 
         fixed[1] = 3;
         assert_eq!(fixed[1], 3);

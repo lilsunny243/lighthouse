@@ -167,7 +167,7 @@ where
         tree_hash::TreeHashType::Vector
     }
 
-    fn tree_hash_packed_encoding(&self) -> Vec<u8> {
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
         unreachable!("Vector should never be packed.")
     }
 
@@ -291,7 +291,7 @@ impl<'a, T: arbitrary::Arbitrary<'a>, N: 'static + Unsigned> arbitrary::Arbitrar
         for _ in 0..size {
             vec.push(<T>::arbitrary(u)?);
         }
-        Ok(Self::new(vec).map_err(|_| arbitrary::Error::IncorrectFormat)?)
+        Self::new(vec).map_err(|_| arbitrary::Error::IncorrectFormat)
     }
 }
 
@@ -326,7 +326,7 @@ mod test {
 
         assert_eq!(fixed[0], 1);
         assert_eq!(&fixed[0..1], &vec[0..1]);
-        assert_eq!((&fixed[..]).len(), 8192);
+        assert_eq!((fixed[..]).len(), 8192);
 
         fixed[1] = 3;
         assert_eq!(fixed[1], 3);

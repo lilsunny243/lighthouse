@@ -1,18 +1,23 @@
-use crate::beacon_node_fallback::{AllErrored, Error as FallbackError};
+use crate::beacon_node_fallback::{Error as FallbackError, Errors};
 use crate::{
     beacon_node_fallback::{BeaconNodeFallback, RequireSynced},
+    determine_graffiti,
     graffiti_file::GraffitiFile,
     OfflineOnFailure,
 };
 use crate::{http_metrics::metrics, validator_store::ValidatorStore};
 use environment::RuntimeContext;
-use eth2::types::Graffiti;
 use slog::{crit, debug, error, info, trace, warn};
 use slot_clock::SlotClock;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use types::{BlindedPayload, BlockType, EthSpec, ExecPayload, FullPayload, PublicKeyBytes, Slot};
+use tokio::time::sleep;
+use types::{
+    AbstractExecPayload, BlindedPayload, BlockType, EthSpec, FullPayload, Graffiti, PublicKeyBytes,
+    Slot,
+};
 
 #[derive(Debug)]
 pub enum BlockError {
@@ -20,8 +25,8 @@ pub enum BlockError {
     Irrecoverable(String),
 }
 
-impl From<AllErrored<BlockError>> for BlockError {
-    fn from(e: AllErrored<BlockError>) -> Self {
+impl From<Errors<BlockError>> for BlockError {
+    fn from(e: Errors<BlockError>) -> Self {
         if e.0.iter().any(|(_, error)| {
             matches!(
                 error,
@@ -43,7 +48,7 @@ pub struct BlockServiceBuilder<T, E: EthSpec> {
     context: Option<RuntimeContext<E>>,
     graffiti: Option<Graffiti>,
     graffiti_file: Option<GraffitiFile>,
-    strict_fee_recipient: bool,
+    block_delay: Option<Duration>,
 }
 
 impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
@@ -55,7 +60,7 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
             context: None,
             graffiti: None,
             graffiti_file: None,
-            strict_fee_recipient: false,
+            block_delay: None,
         }
     }
 
@@ -89,8 +94,8 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
         self
     }
 
-    pub fn strict_fee_recipient(mut self, strict_fee_recipient: bool) -> Self {
-        self.strict_fee_recipient = strict_fee_recipient;
+    pub fn block_delay(mut self, block_delay: Option<Duration>) -> Self {
+        self.block_delay = block_delay;
         self
     }
 
@@ -111,7 +116,7 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
                     .ok_or("Cannot build BlockService without runtime_context")?,
                 graffiti: self.graffiti,
                 graffiti_file: self.graffiti_file,
-                strict_fee_recipient: self.strict_fee_recipient,
+                block_delay: self.block_delay,
             }),
         })
     }
@@ -125,7 +130,7 @@ pub struct Inner<T, E: EthSpec> {
     context: RuntimeContext<E>,
     graffiti: Option<Graffiti>,
     graffiti_file: Option<GraffitiFile>,
-    strict_fee_recipient: bool,
+    block_delay: Option<Duration>,
 }
 
 /// Attempts to produce attestations for any block producer(s) at the start of the epoch.
@@ -170,6 +175,16 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
             async move {
                 while let Some(notif) = notification_rx.recv().await {
                     let service = self.clone();
+
+                    if let Some(delay) = service.block_delay {
+                        debug!(
+                            service.context.log(),
+                            "Delaying block production by {}ms",
+                            delay.as_millis()
+                        );
+                        sleep(delay).await;
+                    }
+
                     service.do_update(notif).await.ok();
                 }
                 debug!(log, "Block service shutting down");
@@ -282,7 +297,7 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
     }
 
     /// Produce a block at the given slot for validator_pubkey
-    async fn publish_block<Payload: ExecPayload<E>>(
+    async fn publish_block<Payload: AbstractExecPayload<E>>(
         self,
         slot: Slot,
         validator_pubkey: PublicKeyBytes,
@@ -307,26 +322,24 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
             })?
             .into();
 
-        let graffiti = self
-            .graffiti_file
-            .clone()
-            .and_then(|mut g| match g.load_graffiti(&validator_pubkey) {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!(log, "Failed to read graffiti file"; "error" => ?e);
-                    None
-                }
-            })
-            .or_else(|| self.validator_store.graffiti(&validator_pubkey))
-            .or(self.graffiti);
+        let graffiti = determine_graffiti(
+            &validator_pubkey,
+            log,
+            self.graffiti_file.clone(),
+            self.validator_store.graffiti(&validator_pubkey),
+            self.graffiti,
+        );
 
         let randao_reveal_ref = &randao_reveal;
         let self_ref = &self;
         let proposer_index = self.validator_store.validator_index(&validator_pubkey);
         let validator_pubkey_ref = &validator_pubkey;
-        let fee_recipient = self.validator_store.get_fee_recipient(&validator_pubkey);
 
-        let strict_fee_recipient = self.strict_fee_recipient;
+        info!(
+            log,
+            "Requesting unsigned block";
+            "slot" => slot.as_u64(),
+        );
         // Request block from first responsive beacon node.
         let block = self
             .beacon_nodes
@@ -377,17 +390,11 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
                         }
                     };
 
-                    // Ensure the correctness of the execution payload's fee recipient.
-                    if strict_fee_recipient {
-                        if let Ok(execution_payload) = block.body().execution_payload() {
-                            if Some(execution_payload.fee_recipient()) != fee_recipient {
-                                return Err(BlockError::Recoverable(
-                                    "Incorrect fee recipient used by builder".to_string(),
-                                ));
-                            }
-                        }
-                    }
-
+                    info!(
+                        log,
+                        "Received unsigned block";
+                        "slot" => slot.as_u64(),
+                    );
                     if proposer_index != Some(block.proposer_index()) {
                         return Err(BlockError::Recoverable(
                             "Proposer index does not match block proposer. Beacon chain re-orged"
@@ -406,6 +413,11 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
             .await
             .map_err(|e| BlockError::Recoverable(format!("Unable to sign block: {:?}", e)))?;
 
+        info!(
+            log,
+            "Publishing signed block";
+            "slot" => slot.as_u64(),
+        );
         // Publish block with first available beacon node.
         self.beacon_nodes
             .first_success(
@@ -458,6 +470,7 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
             "graffiti" => ?graffiti.map(|g| g.as_utf8_lossy()),
             "slot" => signed_block.slot().as_u64(),
         );
+
         Ok(())
     }
 }

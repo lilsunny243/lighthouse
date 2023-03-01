@@ -194,6 +194,21 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .help("Lighthouse by default does not discover private IP addresses. Set this flag to enable connection attempts to local addresses.")
                 .takes_value(false),
         )
+        .arg(
+            Arg::with_name("self-limiter")
+            .long("self-limiter")
+            .help(
+                "Enables the outbound rate limiter (requests made by this node).\
+                \
+                Rate limit quotas per protocol can be set in the form of \
+                <protocol_name>:<tokens>/<time_in_seconds>. To set quotas for multiple protocols, \
+                separate them by ';'. If the self rate limiter is enabled and a protocol is not \
+                present in the configuration, the quotas used for the inbound rate limiter will be \
+                used."
+            )
+            .min_values(0)
+            .hidden(true)
+        )
         /* REST API related arguments */
         .arg(
             Arg::with_name("http")
@@ -320,6 +335,15 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 and never provide an untrusted URL.")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("monitoring-endpoint-period")
+                .long("monitoring-endpoint-period")
+                .value_name("SECONDS")
+                .help("Defines how many seconds to wait between each message sent to \
+                       the monitoring-endpoint. Default: 60s")
+                .requires("monitoring-endpoint")
+                .takes_value(true),
+        )
 
         /*
          * Standard staking flags
@@ -363,9 +387,9 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .long("eth1-endpoints")
                 .value_name("HTTP-ENDPOINTS")
                 .conflicts_with("eth1-endpoint")
-                .help("One or more comma-delimited server endpoints for web3 connection. \
-                       If multiple endpoints are given the endpoints are used as fallback in the \
-                       given order. Also enables the --eth1 flag. \
+                .help("One http endpoint for a web3 connection to an execution node. \
+                       Note: This flag is now only useful for testing, use `--execution-endpoint` \
+                       flag to connect to an execution node on mainnet and testnets.
                        Defaults to http://127.0.0.1:8545.")
                 .takes_value(true)
         )
@@ -431,7 +455,6 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                        JSON-RPC connection. Uses the same endpoint to populate the \
                        deposit cache.")
                 .takes_value(true)
-                .requires("execution-jwt")
         )
         .arg(
             Arg::with_name("execution-jwt")
@@ -441,6 +464,17 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .help("File path which contains the hex-encoded JWT secret for the \
                        execution endpoint provided in the --execution-endpoint flag.")
                 .requires("execution-endpoint")
+                .takes_value(true)
+        )
+        .arg(
+            Arg::with_name("execution-jwt-secret-key")
+                .long("execution-jwt-secret-key")
+                .value_name("EXECUTION-JWT-SECRET-KEY")
+                .alias("jwt-secret-key")
+                .help("Hex-encoded JWT secret for the \
+                       execution endpoint provided in the --execution-endpoint flag.")
+                .requires("execution-endpoint")
+                .conflicts_with("execution-jwt")
                 .takes_value(true)
         )
         .arg(
@@ -484,7 +518,14 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .requires("execution-endpoint")
                 .takes_value(true)
         )
-
+        .arg(
+            Arg::with_name("execution-timeout-multiplier")
+                .long("execution-timeout-multiplier")
+                .value_name("NUM")
+                .help("Unsigned integer to multiply the default execution timeouts by.")
+                .default_value("1")
+                .takes_value(true)
+        )
         /*
          * Database purging and compaction.
          */
@@ -503,6 +544,15 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
             Arg::with_name("auto-compact-db")
                 .long("auto-compact-db")
                 .help("Enable or disable automatic compaction of the database on finalization.")
+                .takes_value(true)
+                .default_value("true")
+        )
+        .arg(
+            Arg::with_name("prune-payloads")
+                .long("prune-payloads")
+                .help("Prune execution payloads from Lighthouse's database. This saves space but \
+                       imposes load on the execution client, as payloads need to be \
+                       reconstructed and sent to syncing peers.")
                 .takes_value(true)
                 .default_value("true")
         )
@@ -680,6 +730,14 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .conflicts_with("checkpoint-state")
         )
         .arg(
+            Arg::with_name("checkpoint-sync-url-timeout")
+                .long("checkpoint-sync-url-timeout")
+                .help("Set the timeout for checkpoint sync calls to remote beacon node HTTP endpoint.")
+                .value_name("SECONDS")
+                .takes_value(true)
+                .default_value("60")
+        )
+        .arg(
             Arg::with_name("reconstruct-historic-states")
                 .long("reconstruct-historic-states")
                 .help("After a checkpoint sync, reconstruct historic states in the database.")
@@ -711,12 +769,55 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .takes_value(true)
         )
         .arg(
+            Arg::with_name("validator-monitor-individual-tracking-threshold")
+                .long("validator-monitor-individual-tracking-threshold")
+                .help("Once the validator monitor reaches this number of local validators \
+                    it will stop collecting per-validator Prometheus metrics and issuing \
+                    per-validator logs. Instead, it will provide aggregate metrics and logs. \
+                    This avoids infeasibly high cardinality in the Prometheus database and \
+                    high log volume when using many validators. Defaults to 64.")
+                .value_name("INTEGER")
+                .takes_value(true)
+        )
+        .arg(
             Arg::with_name("disable-lock-timeouts")
                 .long("disable-lock-timeouts")
                 .help("Disable the timeouts applied to some internal locks by default. This can \
                        lead to less spurious failures on slow hardware but is considered \
                        experimental as it may obscure performance issues.")
                 .takes_value(false)
+        )
+        .arg(
+            Arg::with_name("disable-proposer-reorgs")
+                .long("disable-proposer-reorgs")
+                .help("Do not attempt to reorg late blocks from other validators when proposing.")
+                .takes_value(false)
+        )
+        .arg(
+            Arg::with_name("proposer-reorg-threshold")
+                .long("proposer-reorg-threshold")
+                .value_name("PERCENT")
+                .help("Percentage of vote weight below which to attempt a proposer reorg. \
+                       Default: 20%")
+                .conflicts_with("disable-proposer-reorgs")
+        )
+        .arg(
+            Arg::with_name("proposer-reorg-epochs-since-finalization")
+                .long("proposer-reorg-epochs-since-finalization")
+                .value_name("EPOCHS")
+                .help("Maximum number of epochs since finalization at which proposer reorgs are \
+                       allowed. Default: 2")
+                .conflicts_with("disable-proposer-reorgs")
+        )
+        .arg(
+            Arg::with_name("prepare-payload-lookahead")
+                .long("prepare-payload-lookahead")
+                .value_name("MILLISECONDS")
+                .help("The time before the start of a proposal slot at which payload attributes \
+                       should be sent. Low values are useful for execution nodes which don't \
+                       improve their payload after the first call, and high values are useful \
+                       for ensuring the EL is given ample notice. Default: 1/3 of a slot.")
+                .takes_value(true)
         )
         .arg(
             Arg::with_name("fork-choice-before-proposal-timeout")
@@ -778,6 +879,21 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .takes_value(false)
         )
         .arg(
+            Arg::with_name("builder-profit-threshold")
+                .long("builder-profit-threshold")
+                .value_name("WEI_VALUE")
+                .help("The minimum reward in wei provided to the proposer by a block builder for \
+                    an external payload to be considered for inclusion in a proposal. If this \
+                    threshold is not met, the local EE's payload will be used. This is currently \
+                    *NOT* in comparison to the value of the local EE's payload. It simply checks \
+                    whether the total proposer reward from an external payload is equal to or \
+                    greater than this value. In the future, a comparison to a local payload is \
+                    likely to be added. Example: Use 250000000000000000 to set the threshold to \
+                     0.25 ETH.")
+                .default_value("0")
+                .takes_value(true)
+        )
+        .arg(
             Arg::with_name("count-unrealized")
                 .long("count-unrealized")
                 .hidden(true)
@@ -787,11 +903,49 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .default_value("true")
         )
         .arg(
+            Arg::with_name("count-unrealized-full")
+                .long("count-unrealized-full")
+                .hidden(true)
+                .help("Stricter version of `count-unrealized`.")
+                .takes_value(true)
+                .default_value("false")
+        )
+        .arg(
             Arg::with_name("reset-payload-statuses")
                 .long("reset-payload-statuses")
                 .help("When present, Lighthouse will forget the payload statuses of any \
                        already-imported blocks. This can assist in the recovery from a consensus \
                        failure caused by the execution layer.")
+                .takes_value(false)
+        )
+        .arg(
+            Arg::with_name("disable-deposit-contract-sync")
+                .long("disable-deposit-contract-sync")
+                .help("Explictly disables syncing of deposit logs from the execution node. \
+                      This overrides any previous option that depends on it. \
+                      Useful if you intend to run a non-validating beacon node.")
+                .takes_value(false)
+        )
+        .arg(
+            Arg::with_name("disable-optimistic-finalized-sync")
+                .long("disable-optimistic-finalized-sync")
+                .help("Force Lighthouse to verify every execution block hash with the execution \
+                       client during finalized sync. By default block hashes will be checked in \
+                       Lighthouse and only passed to the EL if initial verification fails.")
+        )
+        .arg(
+            Arg::with_name("light-client-server")
+                .long("light-client-server")
+                .help("Act as a full node supporting light clients on the p2p network \
+                       [experimental]")
+                .takes_value(false)
+        )
+        .arg(
+            Arg::with_name("gui")
+                .long("gui")
+                .hidden(true)
+                .help("Enable the graphical user interface and all its requirements. \
+                      This is equivalent to --http and --validator-monitor-auto.")
                 .takes_value(false)
         )
 }

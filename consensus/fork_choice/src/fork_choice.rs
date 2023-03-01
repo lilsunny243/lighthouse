@@ -1,5 +1,8 @@
 use crate::{ForkChoiceStore, InvalidationOperation};
-use proto_array::{Block as ProtoBlock, ExecutionStatus, ProtoArrayForkChoice};
+use proto_array::{
+    Block as ProtoBlock, CountUnrealizedFull, ExecutionStatus, ProposerHeadError, ProposerHeadInfo,
+    ProtoArrayForkChoice, ReOrgThreshold,
+};
 use slog::{crit, debug, warn, Logger};
 use ssz_derive::{Decode, Encode};
 use state_processing::{
@@ -10,9 +13,10 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::time::Duration;
 use types::{
-    consts::merge::INTERVALS_PER_SLOT, AttestationShufflingId, AttesterSlashing, BeaconBlockRef,
-    BeaconState, BeaconStateError, ChainSpec, Checkpoint, Epoch, EthSpec, ExecPayload,
-    ExecutionBlockHash, Hash256, IndexedAttestation, RelativeEpoch, SignedBeaconBlock, Slot,
+    consts::merge::INTERVALS_PER_SLOT, AbstractExecPayload, AttestationShufflingId,
+    AttesterSlashing, BeaconBlockRef, BeaconState, BeaconStateError, ChainSpec, Checkpoint, Epoch,
+    EthSpec, ExecPayload, ExecutionBlockHash, Hash256, IndexedAttestation, RelativeEpoch,
+    SignedBeaconBlock, Slot,
 };
 
 #[derive(Debug)]
@@ -20,7 +24,8 @@ pub enum Error<T> {
     InvalidAttestation(InvalidAttestation),
     InvalidAttesterSlashing(AttesterSlashingValidationError),
     InvalidBlock(InvalidBlock),
-    ProtoArrayError(String),
+    ProtoArrayStringError(String),
+    ProtoArrayError(proto_array::Error),
     InvalidProtoArrayBytes(String),
     InvalidLegacyProtoArrayBytes(String),
     FailedToProcessInvalidExecutionPayload(String),
@@ -42,6 +47,7 @@ pub enum Error<T> {
     ForkChoiceStoreError(T),
     UnableToSetJustifiedCheckpoint(T),
     AfterBlockFailed(T),
+    ProposerHeadError(T),
     InvalidAnchor {
         block_slot: Slot,
         state_slot: Slot,
@@ -56,6 +62,13 @@ pub enum Error<T> {
     },
     MissingFinalizedBlock {
         finalized_checkpoint: Checkpoint,
+    },
+    WrongSlotForGetProposerHead {
+        current_slot: Slot,
+        fc_store_slot: Slot,
+    },
+    ProposerBoostNotExpiredForGetProposerHead {
+        proposer_boost_root: Hash256,
     },
     UnrealizedVoteProcessing(state_processing::EpochProcessingError),
     ParticipationCacheBuild(BeaconStateError),
@@ -151,6 +164,12 @@ pub enum InvalidAttestation {
 
 impl<T> From<String> for Error<T> {
     fn from(e: String) -> Self {
+        Error::ProtoArrayStringError(e)
+    }
+}
+
+impl<T> From<proto_array::Error> for Error<T> {
+    fn from(e: proto_array::Error) -> Self {
         Error::ProtoArrayError(e)
     }
 }
@@ -374,6 +393,7 @@ where
         anchor_block: &SignedBeaconBlock<E>,
         anchor_state: &BeaconState<E>,
         current_slot: Option<Slot>,
+        count_unrealized_full_config: CountUnrealizedFull,
         spec: &ChainSpec,
     ) -> Result<Self, Error<T::Error>> {
         // Sanity check: the anchor must lie on an epoch boundary.
@@ -393,18 +413,18 @@ where
             AttestationShufflingId::new(anchor_block_root, anchor_state, RelativeEpoch::Next)
                 .map_err(Error::BeaconStateError)?;
 
-        // Default any non-merge execution block hashes to 0x000..000.
-        let execution_status = anchor_block.message_merge().map_or_else(
-            |()| ExecutionStatus::irrelevant(),
-            |message| {
-                let execution_payload = &message.body.execution_payload;
-                if execution_payload == &<_>::default() {
+        let execution_status = anchor_block.message().execution_payload().map_or_else(
+            // If the block doesn't have an execution payload then it can't have
+            // execution enabled.
+            |_| ExecutionStatus::irrelevant(),
+            |execution_payload| {
+                if execution_payload.is_default_with_empty_roots() {
                     // A default payload does not have execution enabled.
                     ExecutionStatus::irrelevant()
                 } else {
                     // Assume that this payload is valid, since the anchor should be a trusted block and
                     // state.
-                    ExecutionStatus::Valid(message.body.execution_payload.block_hash())
+                    ExecutionStatus::Valid(execution_payload.block_hash())
                 }
             },
         );
@@ -420,6 +440,7 @@ where
             current_epoch_shuffling_id,
             next_epoch_shuffling_id,
             execution_status,
+            count_unrealized_full_config,
         )?;
 
         let mut fork_choice = Self {
@@ -550,6 +571,69 @@ where
         Ok(head_root)
     }
 
+    /// Get the block to build on as proposer, taking into account proposer re-orgs.
+    ///
+    /// You *must* call `get_head` for the proposal slot prior to calling this function and pass
+    /// in the result of `get_head` as `canonical_head`.
+    pub fn get_proposer_head(
+        &self,
+        current_slot: Slot,
+        canonical_head: Hash256,
+        re_org_threshold: ReOrgThreshold,
+        max_epochs_since_finalization: Epoch,
+    ) -> Result<ProposerHeadInfo, ProposerHeadError<Error<proto_array::Error>>> {
+        // Ensure that fork choice has already been updated for the current slot. This prevents
+        // us from having to take a write lock or do any dequeueing of attestations in this
+        // function.
+        let fc_store_slot = self.fc_store.get_current_slot();
+        if current_slot != fc_store_slot {
+            return Err(ProposerHeadError::Error(
+                Error::WrongSlotForGetProposerHead {
+                    current_slot,
+                    fc_store_slot,
+                },
+            ));
+        }
+
+        // Similarly, the proposer boost for the previous head should already have expired.
+        let proposer_boost_root = self.fc_store.proposer_boost_root();
+        if !proposer_boost_root.is_zero() {
+            return Err(ProposerHeadError::Error(
+                Error::ProposerBoostNotExpiredForGetProposerHead {
+                    proposer_boost_root,
+                },
+            ));
+        }
+
+        self.proto_array
+            .get_proposer_head::<E>(
+                current_slot,
+                canonical_head,
+                self.fc_store.justified_balances(),
+                re_org_threshold,
+                max_epochs_since_finalization,
+            )
+            .map_err(ProposerHeadError::convert_inner_error)
+    }
+
+    pub fn get_preliminary_proposer_head(
+        &self,
+        canonical_head: Hash256,
+        re_org_threshold: ReOrgThreshold,
+        max_epochs_since_finalization: Epoch,
+    ) -> Result<ProposerHeadInfo, ProposerHeadError<Error<proto_array::Error>>> {
+        let current_slot = self.fc_store.get_current_slot();
+        self.proto_array
+            .get_proposer_head_info::<E>(
+                current_slot,
+                canonical_head,
+                self.fc_store.justified_balances(),
+                re_org_threshold,
+                max_epochs_since_finalization,
+            )
+            .map_err(ProposerHeadError::convert_inner_error)
+    }
+
     /// Return information about:
     ///
     /// - The LMD head of the chain.
@@ -638,7 +722,7 @@ where
         op: &InvalidationOperation,
     ) -> Result<(), Error<T::Error>> {
         self.proto_array
-            .process_execution_payload_invalidation(op)
+            .process_execution_payload_invalidation::<E>(op)
             .map_err(Error::FailedToProcessInvalidExecutionPayload)
     }
 
@@ -661,7 +745,7 @@ where
     /// The supplied block **must** pass the `state_transition` function as it will not be run
     /// here.
     #[allow(clippy::too_many_arguments)]
-    pub fn on_block<Payload: ExecPayload<E>>(
+    pub fn on_block<Payload: AbstractExecPayload<E>>(
         &mut self,
         system_time_current_slot: Slot,
         block: BeaconBlockRef<E, Payload>,
@@ -773,7 +857,12 @@ where
                     (parent_justified, parent_finalized)
                 } else {
                     let justification_and_finalization_state = match block {
-                        BeaconBlockRef::Merge(_) | BeaconBlockRef::Altair(_) => {
+                        // TODO(eip4844): Ensure that the final specification
+                        // does not substantially modify per epoch processing.
+                        BeaconBlockRef::Eip4844(_)
+                        | BeaconBlockRef::Capella(_)
+                        | BeaconBlockRef::Merge(_)
+                        | BeaconBlockRef::Altair(_) => {
                             let participation_cache =
                                 per_epoch_processing::altair::ParticipationCache::new(state, spec)
                                     .map_err(Error::ParticipationCacheBuild)?;
@@ -1199,7 +1288,7 @@ where
 
         if store.best_justified_checkpoint().epoch > store.justified_checkpoint().epoch {
             let store = &self.fc_store;
-            if self.is_descendant_of_finalized(store.best_justified_checkpoint().root) {
+            if self.is_finalized_checkpoint_or_descendant(store.best_justified_checkpoint().root) {
                 let store = &mut self.fc_store;
                 store
                     .set_justified_checkpoint(*store.best_justified_checkpoint())
@@ -1240,12 +1329,13 @@ where
 
     /// Returns `true` if the block is known **and** a descendant of the finalized root.
     pub fn contains_block(&self, block_root: &Hash256) -> bool {
-        self.proto_array.contains_block(block_root) && self.is_descendant_of_finalized(*block_root)
+        self.proto_array.contains_block(block_root)
+            && self.is_finalized_checkpoint_or_descendant(*block_root)
     }
 
     /// Returns a `ProtoBlock` if the block is known **and** a descendant of the finalized root.
     pub fn get_block(&self, block_root: &Hash256) -> Option<ProtoBlock> {
-        if self.is_descendant_of_finalized(*block_root) {
+        if self.is_finalized_checkpoint_or_descendant(*block_root) {
             self.proto_array.get_block(block_root)
         } else {
             None
@@ -1254,7 +1344,7 @@ where
 
     /// Returns an `ExecutionStatus` if the block is known **and** a descendant of the finalized root.
     pub fn get_block_execution_status(&self, block_root: &Hash256) -> Option<ExecutionStatus> {
-        if self.is_descendant_of_finalized(*block_root) {
+        if self.is_finalized_checkpoint_or_descendant(*block_root) {
             self.proto_array.get_block_execution_status(block_root)
         } else {
             None
@@ -1289,10 +1379,10 @@ where
             })
     }
 
-    /// Return `true` if `block_root` is equal to the finalized root, or a known descendant of it.
-    pub fn is_descendant_of_finalized(&self, block_root: Hash256) -> bool {
+    /// Return `true` if `block_root` is equal to the finalized checkpoint, or a known descendant of it.
+    pub fn is_finalized_checkpoint_or_descendant(&self, block_root: Hash256) -> bool {
         self.proto_array
-            .is_descendant(self.fc_store.finalized_checkpoint().root, block_root)
+            .is_finalized_checkpoint_or_descendant::<E>(block_root)
     }
 
     /// Returns `Ok(true)` if `block_root` has been imported optimistically or deemed invalid.
@@ -1451,11 +1541,13 @@ where
     pub fn proto_array_from_persisted(
         persisted: &PersistedForkChoice,
         reset_payload_statuses: ResetPayloadStatuses,
+        count_unrealized_full: CountUnrealizedFull,
         spec: &ChainSpec,
         log: &Logger,
     ) -> Result<ProtoArrayForkChoice, Error<T::Error>> {
-        let mut proto_array = ProtoArrayForkChoice::from_bytes(&persisted.proto_array_bytes)
-            .map_err(Error::InvalidProtoArrayBytes)?;
+        let mut proto_array =
+            ProtoArrayForkChoice::from_bytes(&persisted.proto_array_bytes, count_unrealized_full)
+                .map_err(Error::InvalidProtoArrayBytes)?;
         let contains_invalid_payloads = proto_array.contains_invalid_payloads();
 
         debug!(
@@ -1486,7 +1578,7 @@ where
                 "error" => e,
                 "info" => "please report this error",
             );
-            ProtoArrayForkChoice::from_bytes(&persisted.proto_array_bytes)
+            ProtoArrayForkChoice::from_bytes(&persisted.proto_array_bytes, count_unrealized_full)
                 .map_err(Error::InvalidProtoArrayBytes)
         } else {
             debug!(
@@ -1503,11 +1595,17 @@ where
         persisted: PersistedForkChoice,
         reset_payload_statuses: ResetPayloadStatuses,
         fc_store: T,
+        count_unrealized_full: CountUnrealizedFull,
         spec: &ChainSpec,
         log: &Logger,
     ) -> Result<Self, Error<T::Error>> {
-        let proto_array =
-            Self::proto_array_from_persisted(&persisted, reset_payload_statuses, spec, log)?;
+        let proto_array = Self::proto_array_from_persisted(
+            &persisted,
+            reset_payload_statuses,
+            count_unrealized_full,
+            spec,
+            log,
+        )?;
 
         let current_slot = fc_store.get_current_slot();
 
